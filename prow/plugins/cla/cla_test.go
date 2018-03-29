@@ -55,7 +55,7 @@ func TestCLALabels(t *testing.T) {
 		},
 		{
 			name: "cla/linuxfoundation status success does not add/remove labels " +
-				"when not the head commit in a PR",
+					"when not the head commit in a PR",
 			context:   "cla/linuxfoundation",
 			state:     "success",
 			statusSHA: "a",
@@ -70,7 +70,7 @@ func TestCLALabels(t *testing.T) {
 		},
 		{
 			name: "cla/linuxfoundation status failure does not add/remove labels " +
-				"when not the head commit in a PR",
+					"when not the head commit in a PR",
 			context:   "cla/linuxfoundation",
 			state:     "failure",
 			statusSHA: "a",
@@ -169,4 +169,185 @@ func TestCLALabels(t *testing.T) {
 			t.Errorf("Expected: %#v, Got %#v in case %s.", tc.removedLabels, fc.LabelsRemoved, tc.name)
 		}
 	}
+}
+
+func TestCheckCLA(t *testing.T) {
+	var testcases = []struct {
+		name        string
+		context     string
+		state       string
+		SHA         string
+		action      string
+		body        string
+		pullRequest github.PullRequest
+		hasCLAYes   bool
+		hasCLANo    bool
+
+		addedLabel   string
+		removedLabel string
+	}{
+		{
+			name:    "ignore non cla/linuxfoundation context",
+			context: "random/context",
+			state:   "success",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/check-cla",
+			pullRequest: github.PullRequest{
+				State:  "open",
+				Number: 3,
+			},
+		},
+		{
+			name:    "ignore non open PRs",
+			context: "cla/linuxfoundation",
+			state:   "success",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/check-cla",
+			pullRequest: github.PullRequest{
+				State:  "closed",
+				Number: 3,
+			},
+		},
+		{
+			name:    "ignore non /check-cla comments",
+			context: "cla/linuxfoundation",
+			state:   "success",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/shrug",
+			pullRequest: github.PullRequest{
+				State:  "open",
+				Number: 3,
+			},
+		},
+		{
+			name:    "do nothing on when status state is \"pending\"",
+			context: "cla/linuxfoundation",
+			state:   "pending",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/shrug",
+			pullRequest: github.PullRequest{
+				State:  "open",
+				Number: 3,
+			},
+		},
+		{
+			name:    "cla/linuxfoundation status adds the cla-yes label when its state is \"success\"",
+			context: "cla/linuxfoundation",
+			state:   "success",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/check-cla",
+			pullRequest: github.PullRequest{
+				State:  "open",
+				Number: 3,
+			},
+
+			addedLabel: fmt.Sprintf("/#3:%s", claYesLabel),
+		},
+		{
+			name:    "cla/linuxfoundation status adds the cla-yes label and removes cla-no label when its state is \"success\"",
+			context: "cla/linuxfoundation",
+			state:   "success",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/check-cla",
+			pullRequest: github.PullRequest{
+				State:  "open",
+				Number: 3,
+			},
+			hasCLANo: true,
+
+			addedLabel:   fmt.Sprintf("/#3:%s", claYesLabel),
+			removedLabel: fmt.Sprintf("/#3:%s", claNoLabel),
+		},
+		{
+			name:    "cla/linuxfoundation status adds the cla-no label when its state is \"failure\"",
+			context: "cla/linuxfoundation",
+			state:   "failure",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/check-cla",
+			pullRequest: github.PullRequest{
+				State:  "open",
+				Number: 3,
+			},
+
+			addedLabel: fmt.Sprintf("/#3:%s", claNoLabel),
+		},
+		{
+			name:    "cla/linuxfoundation status adds the cla-no label and removes cla-yes label when its state is \"failure\"",
+			context: "cla/linuxfoundation",
+			state:   "failure",
+			SHA:     "sha",
+			action:  "created",
+			body:    "/check-cla",
+			pullRequest: github.PullRequest{
+				State:  "open",
+				Number: 3,
+			},
+			hasCLAYes: true,
+
+			addedLabel:   fmt.Sprintf("/#3:%s", claNoLabel),
+			removedLabel: fmt.Sprintf("/#3:%s", claYesLabel),
+		},
+	}
+	for _, tc := range testcases {
+
+		fc := &fakegithub.FakeClient{
+			CreatedStatuses: make(map[string][]github.Status),
+		}
+		e := &github.ReviewCommentEvent{
+			Action:      github.ReviewCommentEventAction(tc.action),
+			PullRequest: tc.pullRequest,
+			Comment: github.ReviewComment{
+				Body: tc.body,
+			},
+		}
+		e.PullRequest.MergeSHA = &tc.SHA
+		fc.CreatedStatuses["sha"] = []github.Status{
+			{
+				State:   tc.state,
+				Context: tc.context,
+			},
+		}
+		if tc.hasCLAYes {
+			fc.LabelsAdded = append(fc.LabelsAdded, fmt.Sprintf("/#3:%s", claYesLabel))
+		}
+		if tc.hasCLANo {
+			fc.LabelsAdded = append(fc.LabelsAdded, fmt.Sprintf("/#3:%s", claNoLabel))
+		}
+		if err := handleComment(fc, logrus.WithField("plugin", pluginName), e); err != nil {
+			t.Errorf("For case %s, didn't expect error from cla plugin: %v", tc.name, err)
+			continue
+		}
+		ok := tc.addedLabel == ""
+		if !ok {
+			for _, label := range fc.LabelsAdded {
+				if reflect.DeepEqual(tc.addedLabel, label) {
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			t.Errorf("Expected to add: %#v, Got %#v in case %s.", tc.addedLabel, fc.LabelsAdded, tc.name)
+		}
+		ok = tc.removedLabel == ""
+		if !ok {
+			for _, label := range fc.LabelsRemoved {
+				if reflect.DeepEqual(tc.removedLabel, label) {
+					ok = true
+					break
+				}
+			}
+		}
+		if !ok {
+			t.Errorf("Expected to remove: %#v, Got %#v in case %s.", tc.removedLabel, fc.LabelsRemoved, tc.name)
+		}
+	}
+
 }

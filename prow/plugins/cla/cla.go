@@ -25,6 +25,7 @@ import (
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/pluginhelp"
 	"k8s.io/test-infra/prow/plugins"
+	"regexp"
 )
 
 const (
@@ -54,17 +55,22 @@ It may take a couple minutes for the CLA signature to be fully registered; after
 	maxRetries = 5
 )
 
+var (
+	checkCLARe = regexp.MustCompile(`(?mi)^/check-cla\s*$`)
+)
+
 func init() {
 	plugins.RegisterStatusEventHandler(pluginName, handleStatusEvent, helpProvider)
+	plugins.RegisterReviewCommentEventHandler(pluginName, handleCommentEvent, helpProvider)
 }
 
 func helpProvider(config *plugins.Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error) {
 	// The {WhoCanUse, Usage, Examples, Config} fields are omitted because this plugin cannot be
 	// manually triggered and is not configurable.
 	return &pluginhelp.PluginHelp{
-			Description: "The cla plugin manages the application and removal of the 'cncf-cla' prefixed labels on pull requests as a reaction to the " + claContextName + " github status context. It is also responsible for warning unauthorized PR authors that they need to sign the CNCF CLA before their PR will be merged.",
-		},
-		nil
+		Description: "The cla plugin manages the application and removal of the 'cncf-cla' prefixed labels on pull requests as a reaction to the " + claContextName + " github status context. It is also responsible for warning unauthorized PR authors that they need to sign the CNCF CLA before their PR will be merged.",
+	},
+			nil
 }
 
 type gitHubClient interface {
@@ -73,6 +79,8 @@ type gitHubClient interface {
 	RemoveLabel(owner, repo string, number int, label string) error
 	GetPullRequest(owner, repo string, number int) (*github.PullRequest, error)
 	FindIssues(query, sort string, asc bool) ([]github.Issue, error)
+	GetIssueLabels(org, repo string, number int) ([]github.Label, error)
+	ListStatuses(org, repo, ref string) ([]github.Status, error)
 }
 
 func handleStatusEvent(pc plugins.PluginClient, se github.StatusEvent) error {
@@ -170,6 +178,82 @@ func handle(gc gitHubClient, log *logrus.Entry, se github.StatusEvent) error {
 		}
 		if err := gc.AddLabel(org, repo, number, claNoLabel); err != nil {
 			l.WithError(err).Warningf("Could not add %s label.", claNoLabel)
+		}
+	}
+	return nil
+}
+
+func handleCommentEvent(pc plugins.PluginClient, ce github.ReviewCommentEvent) error {
+	return handleComment(pc.GitHubClient, pc.Logger, &ce)
+}
+
+func handleComment(gc gitHubClient, log *logrus.Entry, e *github.ReviewCommentEvent) error {
+	// Only consider open PRs and new comments.
+	if e.PullRequest.State != "open" || e.Action != github.ReviewCommentActionCreated {
+		return nil
+	}
+	// If we create a "/check-cla comment, check for the cla in commit statuses, add cla label if necessary.
+	checkCLA := false
+	if checkCLARe.MatchString(e.Comment.Body) {
+		checkCLA = true
+	} else {
+		return nil
+	}
+
+	org := e.Repo.Owner.Login
+	repo := e.Repo.Name
+	number := e.PullRequest.Number
+	hasCLAYes := false
+	hasCLANo := false
+
+	labels, err := gc.GetIssueLabels(org, repo, number)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to get the labels on %s/%s#%d.", org, repo, number)
+	}
+	for _, candidate := range labels {
+		if candidate.Name == claYesLabel {
+			hasCLAYes = true
+		}
+		if candidate.Name == claNoLabel {
+			hasCLANo = true
+		}
+	}
+
+	if checkCLA {
+		ref := e.PullRequest.MergeSHA
+		statuses, err := gc.ListStatuses(org, repo, *ref)
+		if err != nil {
+			log.WithError(err).Errorf("Failed to get statuses on %s/%s#%d", org, repo, number)
+		}
+		for _, status := range statuses {
+			if status.Context != claContextName {
+				continue
+			}
+
+			if status.State == github.StatusSuccess {
+				if hasCLANo {
+					if err := gc.RemoveLabel(org, repo, number, claNoLabel); err != nil {
+						log.WithError(err).Warningf("Could not remove %s label.", claNoLabel)
+					}
+				}
+				if !hasCLAYes {
+					if err := gc.AddLabel(org, repo, number, claYesLabel); err != nil {
+						log.WithError(err).Warningf("Could not add %s label.", claYesLabel)
+					}
+				}
+			}
+			if status.State == github.StatusFailure {
+				if hasCLAYes {
+					if err := gc.RemoveLabel(org, repo, number, claYesLabel); err != nil {
+						log.WithError(err).Warningf("Could not remove %s label.", claYesLabel)
+					}
+				}
+				if !hasCLANo {
+					if err := gc.AddLabel(org, repo, number, claNoLabel); err != nil {
+						log.WithError(err).Warningf("Could not add %s label.", claNoLabel)
+					}
+				}
+			}
 		}
 	}
 	return nil
