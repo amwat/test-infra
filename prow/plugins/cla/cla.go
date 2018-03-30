@@ -203,6 +203,7 @@ func handleComment(gc gitHubClient, log *logrus.Entry, e *github.ReviewCommentEv
 	org := e.Repo.Owner.Login
 	repo := e.Repo.Name
 	number := e.PullRequest.Number
+	// Could have both
 	hasCLAYes := false
 	hasCLANo := false
 
